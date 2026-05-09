@@ -234,7 +234,7 @@ func validateSegment(args []token) ([]string, error) {
 
 	validators := map[string]segmentValidator{
 		"pwd": validatePwd, "ls": validateLS, "cat": validateCat, "head": validateHeadTail, "tail": validateHeadTail,
-		"wc": validateWC, "rg": validateRG, "grep": validateGrep, "find": validateFind, "git": validateGit,
+		"nl": validateNL, "wc": validateWC, "rg": validateRG, "grep": validateGrep, "find": validateFind, "git": validateGit,
 		"du": validateDU, "df": validateDF, "file": validateFile, "echo": validateEchoPrintf, "printf": validateEchoPrintf,
 		"date": validateDate, "uname": validateUname, "whoami": validateNoArgs, "id": validateNoArgs,
 		"hostname": validateNoArgs, "uptime": validateNoArgs, "true": validateNoArgs, "sort": validateSort,
@@ -271,6 +271,33 @@ func validateCat(args []token) ([]string, error) {
 
 func validateWC(args []token) ([]string, error) {
 	return validateFlagsAndPaths(args, "lwcLm")
+}
+
+func validateNL(args []token) ([]string, error) {
+	if len(args) < 2 {
+		return nil, errors.New("nl requires a path operand")
+	}
+	paths := 0
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg.quoted && strings.HasPrefix(arg.text, "-") {
+			return nil, errors.New("quoted leading-dash operand is not allowed")
+		}
+		if !arg.quoted && arg.text == "-ba" {
+			continue
+		}
+		if strings.HasPrefix(arg.text, "-") {
+			return nil, errors.New("unsupported nl flag")
+		}
+		if err := validatePathArg(arg); err != nil {
+			return nil, err
+		}
+		paths++
+	}
+	if paths == 0 {
+		return nil, errors.New("nl requires a path operand")
+	}
+	return texts(args), nil
 }
 
 func validateDU(args []token) ([]string, error) {
