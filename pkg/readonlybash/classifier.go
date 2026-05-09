@@ -25,8 +25,13 @@ type token struct {
 	quoted bool
 }
 
+type commandSegment struct {
+	args            []token
+	stderrToDevNull bool
+}
+
 type parsedCommand struct {
-	segments [][]token
+	segments []commandSegment
 	ops      []string
 }
 
@@ -47,11 +52,15 @@ func Classify(command string) Classification {
 
 	parts := make([]string, 0, len(parsed.segments)*2-1)
 	for i, segment := range parsed.segments {
-		normalized, err := validateSegment(segment)
+		normalized, err := validateSegment(segment.args)
 		if err != nil {
 			return ask(err.Error())
 		}
-		parts = append(parts, shellJoin(normalized))
+		commandPart := shellJoin(normalized)
+		if segment.stderrToDevNull {
+			commandPart += " 2>/dev/null"
+		}
+		parts = append(parts, commandPart)
 		if i < len(parsed.ops) {
 			parts = append(parts, parsed.ops[i])
 		}
@@ -73,6 +82,7 @@ func parseCommand(input string) (parsedCommand, error) {
 	var current []token
 	var b strings.Builder
 	var tokenQuoted bool
+	stderrToDevNull := false
 	inSingle, inDouble := false, false
 
 	flushToken := func() {
@@ -88,9 +98,10 @@ func parseCommand(input string) (parsedCommand, error) {
 		if len(current) == 0 {
 			return fmt.Errorf("operator %q without command", op)
 		}
-		out.segments = append(out.segments, current)
+		out.segments = append(out.segments, commandSegment{args: current, stderrToDevNull: stderrToDevNull})
 		out.ops = append(out.ops, op)
 		current = nil
+		stderrToDevNull = false
 		return nil
 	}
 
@@ -131,6 +142,21 @@ func parseCommand(input string) (parsedCommand, error) {
 		if isControlByte(c) && c != '\t' {
 			return parsedCommand{}, errors.New("control characters are not allowed")
 		}
+		if b.Len() == 0 && !tokenQuoted && strings.HasPrefix(input[i:], "2>/dev/null") {
+			if len(current) == 0 {
+				return parsedCommand{}, errors.New("stderr redirection without command")
+			}
+			next := i + len("2>/dev/null")
+			if next < len(input) && !isRedirectBoundary(input[next]) {
+				return parsedCommand{}, errors.New("unsupported stderr redirection")
+			}
+			if stderrToDevNull {
+				return parsedCommand{}, errors.New("duplicate stderr redirection")
+			}
+			stderrToDevNull = true
+			i = next - 1
+			continue
+		}
 
 		switch c {
 		case ' ', '\t':
@@ -152,12 +178,20 @@ func parseCommand(input string) (parsedCommand, error) {
 			i++
 		case '|':
 			if i+1 < len(input) && input[i+1] == '|' {
-				return parsedCommand{}, errors.New("logical-or is not allowed")
+				if err := addOp("||"); err != nil {
+					return parsedCommand{}, err
+				}
+				i++
+				continue
 			}
 			if err := addOp("|"); err != nil {
 				return parsedCommand{}, err
 			}
-		case '\n', '\r', ';', '<', '>', '(', ')', '#', '!', '\\':
+		case ';':
+			if err := addOp(";"); err != nil {
+				return parsedCommand{}, err
+			}
+		case '\n', '\r', '<', '>', '(', ')', '#', '!', '\\':
 			return parsedCommand{}, fmt.Errorf("unsupported shell syntax %q", c)
 		case '$', '`':
 			return parsedCommand{}, errors.New("expansion syntax is not allowed")
@@ -174,8 +208,12 @@ func parseCommand(input string) (parsedCommand, error) {
 	if len(current) == 0 {
 		return parsedCommand{}, errors.New("trailing operator")
 	}
-	out.segments = append(out.segments, current)
+	out.segments = append(out.segments, commandSegment{args: current, stderrToDevNull: stderrToDevNull})
 	return out, nil
+}
+
+func isRedirectBoundary(c byte) bool {
+	return c == ' ' || c == '\t' || c == '&' || c == '|' || c == ';'
 }
 
 func isControlByte(c byte) bool {
@@ -199,8 +237,8 @@ func validateSegment(args []token) ([]string, error) {
 		"wc": validateWC, "rg": validateRG, "grep": validateGrep, "find": validateFind, "git": validateGit,
 		"du": validateDU, "df": validateDF, "file": validateFile, "echo": validateEchoPrintf, "printf": validateEchoPrintf,
 		"date": validateDate, "uname": validateUname, "whoami": validateNoArgs, "id": validateNoArgs,
-		"hostname": validateNoArgs, "uptime": validateNoArgs, "node": validateVersion, "python": validateVersion,
-		"python3": validateVersion,
+		"hostname": validateNoArgs, "uptime": validateNoArgs, "true": validateNoArgs, "sort": validateSort,
+		"command": validateCommand, "node": validateVersion, "python": validateVersion, "python3": validateVersion,
 	}
 	validator, ok := validators[cmd]
 	if !ok {
@@ -293,6 +331,7 @@ func validateFile(args []token) ([]string, error) {
 
 func validateHeadTail(args []token) ([]string, error) {
 	cmd := args[0].text
+	normalized := []string{cmd}
 	for i := 1; i < len(args); i++ {
 		arg := args[i]
 		if arg.quoted && strings.HasPrefix(arg.text, "-") {
@@ -301,10 +340,15 @@ func validateHeadTail(args []token) ([]string, error) {
 		if cmd == "tail" && (arg.text == "-f" || arg.text == "-F" || arg.text == "--follow" || strings.HasPrefix(arg.text, "--pid")) {
 			return nil, errors.New("tail follow mode is not allowed")
 		}
+		if !arg.quoted && isDashCount(arg.text) {
+			normalized = append(normalized, "-n", strings.TrimPrefix(arg.text, "-"))
+			continue
+		}
 		if arg.text == "-n" || arg.text == "-c" {
 			if i+1 >= len(args) || !isCount(args[i+1].text) || args[i+1].quoted {
 				return nil, fmt.Errorf("%s requires a count", arg.text)
 			}
+			normalized = append(normalized, arg.text, args[i+1].text)
 			i++
 			continue
 		}
@@ -312,6 +356,7 @@ func validateHeadTail(args []token) ([]string, error) {
 			if !isCount(arg.text[strings.IndexByte(arg.text, '=')+1:]) || arg.quoted {
 				return nil, errors.New("invalid count")
 			}
+			normalized = append(normalized, arg.text)
 			continue
 		}
 		if strings.HasPrefix(arg.text, "-") {
@@ -320,8 +365,9 @@ func validateHeadTail(args []token) ([]string, error) {
 		if err := validatePathArg(arg); err != nil {
 			return nil, err
 		}
+		normalized = append(normalized, arg.text)
 	}
-	return texts(args), nil
+	return normalized, nil
 }
 
 func validateRG(args []token) ([]string, error) {
@@ -436,6 +482,8 @@ func validateGrep(args []token) ([]string, error) {
 }
 
 func validateFind(args []token) ([]string, error) {
+	prevPredicate := false
+	expectPredicate := false
 	for i := 1; i < len(args); i++ {
 		arg := args[i]
 		if arg.quoted && strings.HasPrefix(arg.text, "-") {
@@ -443,29 +491,52 @@ func validateFind(args []token) ([]string, error) {
 		}
 		switch arg.text {
 		case "-maxdepth", "-mindepth":
+			if expectPredicate {
+				return nil, errors.New("find boolean predicate must be between safe predicates")
+			}
 			if i+1 >= len(args) || args[i+1].quoted || !isUint(args[i+1].text) {
 				return nil, errors.New("find depth predicate requires number")
 			}
 			i++
+			prevPredicate = false
 		case "-type":
 			if i+1 >= len(args) || args[i+1].quoted || !oneOf(args[i+1].text, "f", "d", "l", "b", "c", "p", "s") {
 				return nil, errors.New("unsupported find type")
 			}
 			i++
+			prevPredicate = true
+			expectPredicate = false
 		case "-name", "-iname", "-path", "-ipath":
 			if i+1 >= len(args) || isLeadingDash(args[i+1]) {
 				return nil, errors.New("find pattern predicate requires safe pattern")
 			}
 			i++
+			prevPredicate = true
+			expectPredicate = false
+		case "-o", "-a":
+			if !prevPredicate {
+				return nil, errors.New("find boolean predicate must be between safe predicates")
+			}
+			prevPredicate = false
+			expectPredicate = true
 		case "-print", "-print0":
+			prevPredicate = true
+			expectPredicate = false
 		default:
 			if strings.HasPrefix(arg.text, "-") {
 				return nil, errors.New("unsupported find predicate")
 			}
+			if expectPredicate {
+				return nil, errors.New("find boolean predicate must be between safe predicates")
+			}
 			if err := validatePathArg(arg); err != nil {
 				return nil, err
 			}
+			prevPredicate = false
 		}
+	}
+	if expectPredicate {
+		return nil, errors.New("find boolean predicate must be between safe predicates")
 	}
 	return texts(args), nil
 }
@@ -677,6 +748,53 @@ func validateGitTag(args []token) ([]string, error) {
 		return texts(args), nil
 	}
 	return nil, errors.New("unsupported git tag arguments")
+}
+
+func validateSort(args []token) ([]string, error) {
+	allowedLong := set("--reverse", "--numeric-sort", "--ignore-case", "--unique", "--version-sort", "--month-sort", "--human-numeric-sort")
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg.quoted && strings.HasPrefix(arg.text, "-") {
+			return nil, errors.New("quoted leading-dash operand is not allowed")
+		}
+		if _, ok := allowedLong[arg.text]; ok && !arg.quoted {
+			continue
+		}
+		if strings.HasPrefix(arg.text, "-") {
+			if !validShortBundle(arg.text, "fhmnruV") {
+				return nil, errors.New("unsupported sort flag")
+			}
+			continue
+		}
+		if err := validatePathArg(arg); err != nil {
+			return nil, err
+		}
+	}
+	return texts(args), nil
+}
+
+func validateCommand(args []token) ([]string, error) {
+	if len(args) != 3 || args[1].quoted || args[1].text != "-v" || !isSafeCommandLookupName(args[2]) {
+		return nil, errors.New("only command -v with a safe command name is allowed")
+	}
+	return texts(args), nil
+}
+
+func isSafeCommandLookupName(arg token) bool {
+	if arg.quoted || arg.text == "" || strings.HasPrefix(arg.text, "-") || strings.Contains(arg.text, "/") || isAssignment(arg.text) {
+		return false
+	}
+	for _, r := range arg.text {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case strings.ContainsRune("._+-", r):
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func validateEchoPrintf(args []token) ([]string, error) {
@@ -897,6 +1015,10 @@ func isCount(s string) bool {
 		s = s[1:]
 	}
 	return isUint(s)
+}
+
+func isDashCount(s string) bool {
+	return len(s) > 1 && s[0] == '-' && isUint(s[1:])
 }
 
 func isLeadingDash(t token) bool { return strings.HasPrefix(t.text, "-") }
