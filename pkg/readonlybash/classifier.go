@@ -623,10 +623,52 @@ func validateGitTag(args []token) ([]string, error) {
 }
 
 func validateEchoPrintf(args []token) ([]string, error) {
-	if args[0].text == "printf" && len(args) > 1 && strings.HasPrefix(args[1].text, "-") {
+	if args[0].text != "printf" {
+		return texts(args), nil
+	}
+	if len(args) > 1 && strings.HasPrefix(args[1].text, "-") {
 		return nil, errors.New("printf options are not allowed")
 	}
+	if len(args) > 1 && printfFormatHasPercentN(args[1].text) {
+		return nil, errors.New("printf %n is not allowed")
+	}
 	return texts(args), nil
+}
+
+func printfFormatHasPercentN(format string) bool {
+	for i := 0; i < len(format); i++ {
+		if format[i] != '%' {
+			continue
+		}
+		i++
+		if i < len(format) && format[i] == '%' {
+			continue
+		}
+		for i < len(format) && strings.ContainsRune("#0- +", rune(format[i])) {
+			i++
+		}
+		if i < len(format) && format[i] == '*' {
+			i++
+		} else {
+			for i < len(format) && format[i] >= '0' && format[i] <= '9' {
+				i++
+			}
+		}
+		if i < len(format) && format[i] == '.' {
+			i++
+			if i < len(format) && format[i] == '*' {
+				i++
+			} else {
+				for i < len(format) && format[i] >= '0' && format[i] <= '9' {
+					i++
+				}
+			}
+		}
+		if i < len(format) && format[i] == 'n' {
+			return true
+		}
+	}
+	return false
 }
 
 func validateDate(args []token) ([]string, error) {
