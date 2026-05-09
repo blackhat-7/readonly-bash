@@ -96,6 +96,22 @@ func TestSanitizeEnv(t *testing.T) {
 	if m["GIT_OPTIONAL_LOCKS"] != "0" || m["GIT_NO_LAZY_FETCH"] != "1" || m["GIT_CONFIG_COUNT"] != "5" {
 		t.Fatalf("git hardening missing: %+v", m)
 	}
+	if m["GIT_PAGER"] != "cat" || m["PAGER"] != "cat" || m["GIT_TERMINAL_PROMPT"] != "0" {
+		t.Fatalf("git pager/prompt hardening missing: %+v", m)
+	}
+	wantConfig := map[string]string{
+		"0": "core.pager=cat",
+		"1": "core.fsmonitor=false",
+		"2": "core.untrackedCache=false",
+		"3": "log.showSignature=false",
+		"4": "interactive.diffFilter=",
+	}
+	for i, want := range wantConfig {
+		key, value, _ := strings.Cut(want, "=")
+		if m["GIT_CONFIG_KEY_"+i] != key || m["GIT_CONFIG_VALUE_"+i] != value {
+			t.Fatalf("git config override %s missing: %+v", i, m)
+		}
+	}
 	for _, v := range m {
 		if strings.Contains(v, "diff.external") {
 			t.Fatalf("diff.external override should not be set: %+v", m)
