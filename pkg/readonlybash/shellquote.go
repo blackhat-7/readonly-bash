@@ -21,6 +21,9 @@ func shellJoin(tokens []string) string {
 }
 
 func isShellSafe(s string) bool {
+	if strings.HasPrefix(s, "~") {
+		return false
+	}
 	for _, r := range s {
 		switch {
 		case r >= 'a' && r <= 'z':

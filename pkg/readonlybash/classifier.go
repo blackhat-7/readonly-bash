@@ -105,6 +105,9 @@ func parseCommand(input string) (parsedCommand, error) {
 			case '$', '`':
 				return parsedCommand{}, errors.New("expansion syntax is not allowed")
 			default:
+				if isControlByte(c) {
+					return parsedCommand{}, errors.New("control characters are not allowed")
+				}
 				b.WriteByte(c)
 			}
 			continue
@@ -118,9 +121,15 @@ func parseCommand(input string) (parsedCommand, error) {
 			case '$', '`', '\\':
 				return parsedCommand{}, errors.New("expansion syntax is not allowed")
 			default:
+				if isControlByte(c) {
+					return parsedCommand{}, errors.New("control characters are not allowed")
+				}
 				b.WriteByte(c)
 			}
 			continue
+		}
+		if isControlByte(c) && c != '\t' {
+			return parsedCommand{}, errors.New("control characters are not allowed")
 		}
 
 		switch c {
@@ -167,6 +176,10 @@ func parseCommand(input string) (parsedCommand, error) {
 	}
 	out.segments = append(out.segments, current)
 	return out, nil
+}
+
+func isControlByte(c byte) bool {
+	return c < 0x20 || c == 0x7f
 }
 
 func validateSegment(args []token) ([]string, error) {
@@ -244,6 +257,9 @@ func validateDU(args []token) ([]string, error) {
 			}
 			continue
 		}
+		if err := validatePathArg(arg); err != nil {
+			return nil, err
+		}
 	}
 	return texts(args), nil
 }
@@ -267,6 +283,9 @@ func validateFile(args []token) ([]string, error) {
 				return nil, errors.New("unsupported file flag")
 			}
 			continue
+		}
+		if err := validatePathArg(arg); err != nil {
+			return nil, err
 		}
 	}
 	return texts(args), nil
@@ -298,6 +317,9 @@ func validateHeadTail(args []token) ([]string, error) {
 		if strings.HasPrefix(arg.text, "-") {
 			return nil, fmt.Errorf("unsupported %s flag", cmd)
 		}
+		if err := validatePathArg(arg); err != nil {
+			return nil, err
+		}
 	}
 	return texts(args), nil
 }
@@ -305,12 +327,17 @@ func validateHeadTail(args []token) ([]string, error) {
 func validateRG(args []token) ([]string, error) {
 	boolLong := set("--files", "--line-number", "--ignore-case", "--smart-case", "--fixed-strings", "--word-regexp", "--hidden", "--no-ignore", "--no-heading", "--heading", "--json", "--stats", "--count", "--count-matches", "--pretty", "--with-filename", "--files-with-matches", "--files-without-match")
 	boolShort := set("-n", "-i", "-S", "-F", "-w")
+	positionals := 0
+	rgFiles := false
 	for i := 1; i < len(args); i++ {
 		arg := args[i]
 		if arg.quoted && strings.HasPrefix(arg.text, "-") {
 			return nil, errors.New("quoted leading-dash operand is not allowed")
 		}
 		if _, ok := boolLong[arg.text]; ok && !arg.quoted {
+			if arg.text == "--files" {
+				rgFiles = true
+			}
 			continue
 		}
 		if _, ok := boolShort[arg.text]; ok && !arg.quoted {
@@ -352,11 +379,18 @@ func validateRG(args []token) ([]string, error) {
 		if strings.HasPrefix(arg.text, "-") {
 			return nil, errors.New("unsupported rg flag")
 		}
+		if rgFiles || positionals > 0 {
+			if err := validatePathArg(arg); err != nil {
+				return nil, err
+			}
+		}
+		positionals++
 	}
 	return texts(args), nil
 }
 
 func validateGrep(args []token) ([]string, error) {
+	positionals := 0
 	for i := 1; i < len(args); i++ {
 		arg := args[i]
 		if arg.quoted && strings.HasPrefix(arg.text, "-") {
@@ -391,6 +425,12 @@ func validateGrep(args []token) ([]string, error) {
 			}
 			continue
 		}
+		if positionals > 0 {
+			if err := validatePathArg(arg); err != nil {
+				return nil, err
+			}
+		}
+		positionals++
 	}
 	return texts(args), nil
 }
@@ -421,6 +461,9 @@ func validateFind(args []token) ([]string, error) {
 		default:
 			if strings.HasPrefix(arg.text, "-") {
 				return nil, errors.New("unsupported find predicate")
+			}
+			if err := validatePathArg(arg); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -507,6 +550,9 @@ func validateGitDiff(args []token) ([]string, error) {
 			}
 			continue
 		}
+		if err := validateGitPathspec(a); err != nil {
+			return nil, err
+		}
 	}
 	if seenOutput == "" {
 		return nil, errors.New("patch-producing git diff is not allowed")
@@ -574,6 +620,10 @@ func validateGitLog(args []token) ([]string, error) {
 			if strings.HasPrefix(a.text, "-") {
 				return nil, errors.New("unsupported git log flag")
 			}
+			continue
+		}
+		if err := validateGitPathspec(a); err != nil {
+			return nil, err
 		}
 	}
 	return texts(args), nil
@@ -605,6 +655,13 @@ func validateGitLsFiles(args []token) ([]string, error) {
 			if strings.HasPrefix(a.text, "-") {
 				return nil, errors.New("unsupported git ls-files flag or leading-dash pathspec")
 			}
+			if err := validateGitPathspec(a); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if err := validateGitPathspec(a); err != nil {
+			return nil, err
 		}
 	}
 	return texts(args), nil
@@ -623,19 +680,27 @@ func validateGitTag(args []token) ([]string, error) {
 }
 
 func validateEchoPrintf(args []token) ([]string, error) {
-	if args[0].text != "printf" {
+	if args[0].text == "echo" {
+		for _, arg := range args[1:] {
+			if !arg.quoted && strings.HasPrefix(arg.text, "-") {
+				return nil, errors.New("echo options are not allowed")
+			}
+		}
 		return texts(args), nil
 	}
 	if len(args) > 1 && strings.HasPrefix(args[1].text, "-") {
 		return nil, errors.New("printf options are not allowed")
 	}
-	if len(args) > 1 && printfFormatHasPercentN(args[1].text) {
-		return nil, errors.New("printf %n is not allowed")
+	if len(args) > 1 && printfFormatHasUnsafeConversion(args[1].text) {
+		return nil, errors.New("unsafe printf format is not allowed")
+	}
+	if len(args) > 1 && printfFormatHasUnsafeEscape(args[1].text) {
+		return nil, errors.New("unsafe printf escape is not allowed")
 	}
 	return texts(args), nil
 }
 
-func printfFormatHasPercentN(format string) bool {
+func printfFormatHasUnsafeConversion(format string) bool {
 	for i := 0; i < len(format); i++ {
 		if format[i] != '%' {
 			continue
@@ -644,7 +709,7 @@ func printfFormatHasPercentN(format string) bool {
 		if i < len(format) && format[i] == '%' {
 			continue
 		}
-		for i < len(format) && strings.ContainsRune("#0- +", rune(format[i])) {
+		for i < len(format) && strings.ContainsRune("#0- +'", rune(format[i])) {
 			i++
 		}
 		if i < len(format) && format[i] == '*' {
@@ -667,7 +732,26 @@ func printfFormatHasPercentN(format string) bool {
 		for i < len(format) && strings.ContainsRune("hjlLtz", rune(format[i])) {
 			i++
 		}
-		if i < len(format) && format[i] == 'n' {
+		if i < len(format) && (format[i] == 'n' || format[i] == 'b') {
+			return true
+		}
+	}
+	return false
+}
+
+func printfFormatHasUnsafeEscape(format string) bool {
+	for i := 0; i < len(format); i++ {
+		if format[i] != '\\' {
+			continue
+		}
+		i++
+		if i >= len(format) {
+			return true
+		}
+		switch format[i] {
+		case '\\', '\'', '"', 'n', 't':
+			continue
+		default:
 			return true
 		}
 	}
@@ -722,8 +806,40 @@ func validateFlagsAndPaths(args []token, allowedFlags string) ([]string, error) 
 			}
 			continue
 		}
+		if err := validatePathArg(a); err != nil {
+			return nil, err
+		}
 	}
 	return texts(args), nil
+}
+
+func validatePathArg(arg token) error {
+	if strings.HasPrefix(arg.text, "~") {
+		return errors.New("leading-tilde path operand is not allowed")
+	}
+	if isSpecialAbsolutePath(arg.text) {
+		return errors.New("special absolute path is not allowed")
+	}
+	return nil
+}
+
+func validateGitPathspec(arg token) error {
+	if strings.HasPrefix(arg.text, "~") {
+		return errors.New("leading-tilde pathspec is not allowed")
+	}
+	if isSpecialAbsolutePath(arg.text) {
+		return errors.New("special absolute pathspec is not allowed")
+	}
+	return nil
+}
+
+func isSpecialAbsolutePath(path string) bool {
+	for _, root := range []string{"/dev", "/proc", "/sys", "/net"} {
+		if path == root || strings.HasPrefix(path, root+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func texts(args []token) []string {
