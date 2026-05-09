@@ -664,6 +664,9 @@ func printfFormatHasPercentN(format string) bool {
 				}
 			}
 		}
+		for i < len(format) && strings.ContainsRune("hjlLtz", rune(format[i])) {
+			i++
+		}
 		if i < len(format) && format[i] == 'n' {
 			return true
 		}
