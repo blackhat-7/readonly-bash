@@ -476,6 +476,7 @@ func validateGitStatus(args []token) ([]string, error) {
 func validateGitDiff(args []token) ([]string, error) {
 	outModes := set("--stat", "--numstat", "--shortstat", "--name-only", "--name-status")
 	seenOutput := ""
+	revArgs := 0
 	afterSep := false
 	for i := 2; i < len(args); i++ {
 		a := args[i]
@@ -497,7 +498,14 @@ func validateGitDiff(args []token) ([]string, error) {
 			if strings.HasPrefix(a.text, "-") {
 				return nil, errors.New("unsupported git diff flag")
 			}
-			return nil, errors.New("git diff pathspecs require --")
+			if !isSafeGitDiffRev(a.text) {
+				return nil, errors.New("unsupported git diff revision")
+			}
+			revArgs++
+			if revArgs > 2 {
+				return nil, errors.New("too many git diff revisions")
+			}
+			continue
 		}
 	}
 	if seenOutput == "" {
@@ -505,6 +513,23 @@ func validateGitDiff(args []token) ([]string, error) {
 	}
 	normalized := append([]string{"git", "diff", "--no-ext-diff", "--no-textconv"}, texts(args[2:])...)
 	return normalized, nil
+}
+
+func isSafeGitDiffRev(value string) bool {
+	if value == "" || strings.HasPrefix(value, "-") || strings.Contains(value, ":/") || strings.Contains(value, "@{") {
+		return false
+	}
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case strings.ContainsRune("._/@+-^~", r):
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func validateGitLog(args []token) ([]string, error) {
