@@ -9,7 +9,7 @@ Everything else returns `ask` to the host harness.
 ## Core concepts
 
 - **Host adapter**: harness-specific glue; passes `requestID`, `cwd`, `command`, runner path, config paths, and guard constraints.
-- **Classifier**: parses one shell command string and returns `readonly` or `ask`.
+- **Classifier**: parses one shell command string into a small command tree and returns `readonly` or `ask`.
 - **Prepare**: classifier + guard checks + approval creation.
 - **Approval store**: single-use, locked, cwd-bound approval files.
 - **Runner**: no-arg binary mode that claims one approval and executes it under hardened env/shell rules.
@@ -24,7 +24,7 @@ flowchart TD
   D -- no --> Z[Return ask]
   D -- yes --> E{Parse command safely?}
   E -- no --> Z
-  E -- yes --> F{Every segment allowed read-only?}
+  E -- yes --> F{Every command/group allowed read-only?}
   F -- no --> Z
   F -- yes --> G[Normalize commandToRun]
   G --> H{Approval store available?}
@@ -32,6 +32,18 @@ flowchart TD
   H -- yes --> I[Create single-use approval]
   I --> J[Return rewrite to exact runner command]
 ```
+
+## Classifier model
+
+The classifier intentionally recognizes a small shell subset:
+
+- Flat argv command segments connected by `&&`, `||`, `|`, `;`, or newlines.
+- Complete parenthesized command groups whose contents recursively pass the same classifier.
+- Only `/dev/null` stdout/stderr redirections, with or without spaces after `>`.
+- Quoted glob patterns as data; unquoted globs, command substitution, backticks, arbitrary variables, process substitution, comments, backgrounding, and writes are rejected.
+- Exact `$HOME` and `$HOME/...` path forms are normalized to literal absolute paths before rendering; other expansion syntax is rejected.
+
+Read-only coverage is still allowlist-based. Git, `find`, and common agent exploration tools (`stat`, `readlink`, `realpath`, `tree`, `cut`, `tr`, `uniq`, `jq`, path predicates, etc.) each have bounded flag/operand validators. Mutating forms such as `git push`, `git checkout`, `git stash pop`, `find -delete`, `find -exec`, output-file flags, interpreters/eval, network tools, and package managers remain default-deny. Read-only means no mutation/execution/network by classifier policy; it is not a privacy boundary for readable files.
 
 ## Runner flow
 
@@ -72,7 +84,8 @@ stateDiagram-v2
 - Runner config is loaded from a baked default config path.
 - `requestID` is diagnostic; runner matching is by locked approval + canonical cwd.
 - Approval TTL is only crash cleanup, not concurrency.
-- Unknown commands, flags, shell syntax, network tools, mutations, and parse failures are not approved.
+- Unknown commands, flags, unsafe shell syntax, network tools, mutations, and parse failures are not approved.
+- Allowlisted exploration commands are read-only by subcommand/flag/operand shape, not by command name alone.
 
 ## Safety gates
 
@@ -80,11 +93,12 @@ stateDiagram-v2
 flowchart LR
   A[Original command] --> B[Guard checks]
   B --> C[Shell parser restrictions]
-  C --> D[Command allowlist]
-  D --> E[Flag/operand validators]
-  E --> F[Normalization + quoting]
-  F --> G[Single-flight approval store]
-  G --> H[Hardened runner]
+  C --> D[Command tree/group validation]
+  D --> E[Command allowlist]
+  E --> F[Flag/operand validators]
+  F --> G[Normalization + quoting]
+  G --> H[Single-flight approval store]
+  H --> I[Hardened runner]
 ```
 
 ## Host responsibilities

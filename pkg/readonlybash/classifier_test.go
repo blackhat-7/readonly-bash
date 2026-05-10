@@ -83,6 +83,117 @@ func TestClassifyAllowsReadOnlyCommands(t *testing.T) {
 	}
 }
 
+func TestClassifyAllowsRequiredRepoInspectionCommands(t *testing.T) {
+	tests := map[string]string{
+		"git branch -a":                       "git branch -a",
+		"git log --oneline -20":               "git log --oneline -20",
+		"git remote -v":                       "git remote -v",
+		"git log --stat --oneline -5":         "git log --no-ext-diff --no-textconv --stat --oneline -5",
+		"git shortlog -sne | head -10":        "git shortlog -sne | head -n 10",
+		"git log --all --oneline --graph -25": "git log --all --oneline --graph -25",
+		"find . -maxdepth 3 -type f -not -path './.git/*' | head -80": "find . -maxdepth 3 -type f -not -path './.git/*' | head -n 80",
+		"git diff master origin/nix-rpi --stat | head -30":            "git diff --no-ext-diff --no-textconv master origin/nix-rpi --stat | head -n 30",
+		"git log --all --oneline --decorate --graph -30":              "git log --all --oneline --decorate --graph -30",
+		"git rev-list --count --all":                                  "git rev-list --count --all",
+		"git tag -l":                                                  "git tag -l",
+		"git log --format=\"%h %s\" --all | wc -l":                    "git log '--format=%h %s' --all | wc -l",
+		"find . -maxdepth 4 -type f -not -path './.git/*' -not -path './.direnv/*' -not -path './result/*' | sort": "find . -maxdepth 4 -type f -not -path './.git/*' -not -path './.direnv/*' -not -path './result/*' | sort",
+		"git log --all --format=\"%h %ad %s\" --date=short | head -30":                                             "git log --all '--format=%h %ad %s' --date=short | head -n 30",
+		"git reflog | head -20":                        "git reflog | head -n 20",
+		"git log --all --oneline --reverse | head -20": "git log --all --oneline --reverse | head -n 20",
+		"git log --oneline --grep=\"feat\" | wc -l && git log --oneline --grep=\"fix\" | wc -l && git log --oneline --grep=\"refactor\" | wc -l": "git log --oneline --grep=feat | wc -l && git log --oneline --grep=fix | wc -l && git log --oneline --grep=refactor | wc -l",
+		"git stash list": "git stash list",
+		"git log --all --format=\"%an\" | sort | uniq -c | sort -rn | head -10": "git log --all --format=%an | sort | uniq -c | sort -rn | head -n 10",
+		"pwd && ls -la && (git rev-parse --show-toplevel 2>/dev/null || true) && find . -maxdepth 2 -type d -name .git -prune -o -maxdepth 2 -type f \\( -name 'package.json' -o -name 'pyproject.toml' -o -name 'go.mod' -o -name 'Cargo.toml' -o -name 'flake.nix' -o -name '*.ts' -o -name '*.js' -o -name '*.py' \\) -print | head -80": "pwd && ls -la && ( git rev-parse --show-toplevel 2>/dev/null || true ) && find . -maxdepth 2 -type d -name .git -prune -o -maxdepth 2 -type f '(' -name package.json -o -name pyproject.toml -o -name go.mod -o -name Cargo.toml -o -name flake.nix -o -name '*.ts' -o -name '*.js' -o -name '*.py' ')' -print | head -n 80",
+		"git -C \"$HOME/Documents/projects/readonly-bash\" status --short --branch && find \"$HOME/Documents/projects/readonly-bash\" -maxdepth 3 -type f -not -path '*/.git/*' | sort | head -120":                                                                                                                                         "git -C /Users/illusion/Documents/projects/readonly-bash status --short --branch && find /Users/illusion/Documents/projects/readonly-bash -maxdepth 3 -type f -not -path '*/.git/*' | sort | head -n 120",
+	}
+	for command, want := range tests {
+		t.Run(command, func(t *testing.T) {
+			got := Classify(command)
+			if got.Decision != DecisionReadOnly {
+				t.Fatalf("decision=%s reason=%s", got.Decision, got.Reason)
+			}
+			if got.CommandToRun != want {
+				t.Fatalf("commandToRun=%q want %q", got.CommandToRun, want)
+			}
+		})
+	}
+}
+
+func TestClassifyAllowsCommonExplorationCommands(t *testing.T) {
+	tests := map[string]string{
+		"false":                                              "false",
+		"stat -f '%z' README.md":                             "stat -f %z README.md",
+		"readlink -f path":                                   "readlink -f path",
+		"realpath README.md":                                 "realpath README.md",
+		"tree -L 2 -a .":                                     "tree -L 2 -a .",
+		"cut -d ':' -f 1 /etc/passwd":                        "cut -d : -f 1 /etc/passwd",
+		"tr a-z A-Z":                                         "tr a-z A-Z",
+		"basename src/main.go":                               "basename src/main.go",
+		"dirname src/main.go":                                "dirname src/main.go",
+		"test -f README.md":                                  "test -f README.md",
+		"jq -r '.name' package.json":                         "jq -r .name package.json",
+		"git describe --tags --always":                       "git describe --tags --always",
+		"git show-ref --heads":                               "git show-ref --heads",
+		"git symbolic-ref --short HEAD":                      "git symbolic-ref --short HEAD",
+		"git worktree list --porcelain":                      "git worktree list --porcelain",
+		"git submodule status --recursive":                   "git submodule status --recursive",
+		"git count-objects -vH":                              "git count-objects -vH",
+		"git cat-file -t HEAD":                               "git cat-file -t HEAD",
+		"git blame -L 1,10 README.md":                        "git blame --no-textconv -L 1,10 README.md",
+		"git -C \"$HOME\" status --short":                    "git -C /Users/illusion status --short",
+		"ls \"$HOME\"":                                       "ls /Users/illusion",
+		"cd $HOME && pwd":                                    "cd /Users/illusion && pwd",
+		"pwd > /dev/null && echo ok":                         "pwd >/dev/null && echo ok",
+		"pwd 1> /dev/null && echo ok":                        "pwd >/dev/null && echo ok",
+		"git rev-parse --show-toplevel 2> /dev/null || true": "git rev-parse --show-toplevel 2>/dev/null || true",
+		"echo -- -n":                                         "echo -- -n",
+		"nl":                                                 "nl",
+		"sed 's/a/b/I' file.txt":                             "sed s/a/b/I file.txt",
+		"sed 's/a/b/2g' file.txt":                            "sed s/a/b/2g file.txt",
+		"head -n -1 README.md":                               "head -n -1 README.md",
+		"sort -R --debug README.md":                          "sort -R --debug README.md",
+		"sort --buffer-size=1M README.md":                    "sort --buffer-size=1M README.md",
+		"find . -writable -o -executable -print":             "find . -writable -o -executable -print",
+		"find . -newer README.md -samefile go.mod -print":    "find . -newer README.md -samefile go.mod -print",
+		"find . -inum 1 -links +1 -user root -group staff -perm -u+w -printf '%p\\n'": "find . -inum 1 -links +1 -user root -group staff -perm -u+w -printf '%p\\n'",
+		"git stash show":                                  "git stash show --no-ext-diff --no-textconv",
+		"git archive --list":                              "git archive --list",
+		"git verify-commit HEAD":                          "git verify-commit HEAD",
+		"git verify-tag v1.0":                             "git verify-tag v1.0",
+		"git var -l":                                      "git var -l",
+		"git config --list":                               "git config --list",
+		"git help status":                                 "git help status",
+		"git bundle list-heads bundle.file":               "git bundle list-heads bundle.file",
+		"git notes list":                                  "git notes list",
+		"git rerere status":                               "git rerere status",
+		"jq -n '{\"ok\":true}'":                           "jq -n '{\"ok\":true}'",
+		"jq --arg name value '.name' file.json":           "jq --arg name value .name file.json",
+		"jq --slurpfile docs docs.json '.docs' file.json": "jq --slurpfile docs docs.json .docs file.json",
+		"jq --from-file filter.jq file.json":              "jq --from-file filter.jq file.json",
+		"date -d '2 days ago' +%s":                        "date -d '2 days ago' +%s",
+		"date -r README.md +%s":                           "date -r README.md +%s",
+		"date -Iseconds":                                  "date -Iseconds",
+		"test -w README.md":                               "test -w README.md",
+		"tr -t a-z A-Z":                                   "tr -t a-z A-Z",
+		"cut --output-delimiter=:: -f 1 file.tsv":         "cut --output-delimiter=:: -f 1 file.tsv",
+		"du --apparent-size --exclude='*.git' .":          "du --apparent-size '--exclude=*.git' .",
+		"tree --fromfile file-list.txt":                   "tree --fromfile file-list.txt",
+		"wc --files0-from files.list":                     "wc --files0-from files.list",
+	}
+	for command, want := range tests {
+		t.Run(command, func(t *testing.T) {
+			got := Classify(command)
+			if got.Decision != DecisionReadOnly {
+				t.Fatalf("decision=%s reason=%s", got.Decision, got.Reason)
+			}
+			if got.CommandToRun != want {
+				t.Fatalf("commandToRun=%q want %q", got.CommandToRun, want)
+			}
+		})
+	}
+}
+
 func TestClassifyRejectsUnsafeCommands(t *testing.T) {
 	tests := []string{
 		"rm file",
@@ -92,7 +203,6 @@ func TestClassifyRejectsUnsafeCommands(t *testing.T) {
 		"mv a b",
 		"sed -i s/a/b/ file",
 		"sed -e '1,2p' file",
-		"sed 's/a/b/' file",
 		"sed -n '1,2w out' file",
 		"sed -n '1,2e sh' file",
 		"sed -n '1,2p' '-leading'",
@@ -142,7 +252,6 @@ func TestClassifyRejectsUnsafeCommands(t *testing.T) {
 		"sort -o out README.md",
 		"command -v /bin/ls",
 		"command -v FOO=bar",
-		"nl",
 		"nl -v 1 example.txt",
 		"nl -ba /dev/tty",
 		"pwd # comment",
@@ -185,7 +294,6 @@ func TestClassifyRejectsUnsafeCommands(t *testing.T) {
 		"git diff --stat :/magic",
 		"git diff --stat HEAD@{1}",
 		"git diff --stat 'bad;rev'",
-		"git log --stat",
 		"git log --numstat",
 		"git log --name-only",
 		"git log --name-status",
@@ -293,6 +401,42 @@ func TestClassifyRejectsUnsafeCommands(t *testing.T) {
 		"find /net -maxdepth 2 -print",
 		"ls -R /net",
 		"find . -name '*.go' -o -delete",
+		"find . -fprint out",
+		"find . -printf '%p\n'",
+		"find . -name '*.go' -o -exec sh -c pwd ;",
+		"(rm file)",
+		"(git push || true)",
+		"(cd docs && pwd)",
+		"echo \"$PATH\"",
+		"git -C \"x$HOME/Documents/projects/readonly-bash\" status --short",
+		"git log --format='%x1b]52;c;x%a'",
+		"git log --pretty=format:%n",
+		"git log --format='%G?'",
+		"git stash pop",
+		"git reflog expire --all",
+		"git rev-list --objects --all",
+		"git branch -D main",
+		"git worktree add ../copy",
+		"git submodule update --init",
+		"git count-objects --unknown",
+		"git cat-file --filters HEAD:README.md",
+		"git blame --output out README.md",
+		"tree -o out .",
+		"stat --printf='\\e]52;c;x' README.md",
+		"tr a '\\033'",
+		"sort --compress-program=gzip README.md",
+		"find . -fprintf out '%p\n'",
+		"git stash show --output out",
+		"git config user.name value",
+		"git help -a",
+		"jq -L /dev .",
+		"jq 'env' package.json",
+		"test README.md -ef other",
+		"readlink /dev/tty",
+		"wc --files0-from=/dev/tty",
+		"pwd 2> err",
+		"pwd < /dev/null",
+		"pwd >> /dev/null",
 		"pwd | rm file",
 	}
 	for _, command := range tests {
