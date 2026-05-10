@@ -28,6 +28,7 @@ type token struct {
 
 type commandSegment struct {
 	args            []token
+	stdoutToDevNull bool
 	stderrToDevNull bool
 }
 
@@ -61,6 +62,9 @@ func Classify(command string) Classification {
 			return ask(err.Error())
 		}
 		commandPart := shellJoin(normalized)
+		if segment.stdoutToDevNull {
+			commandPart += " >/dev/null"
+		}
 		if segment.stderrToDevNull {
 			commandPart += " 2>/dev/null"
 		}
@@ -120,6 +124,7 @@ func parseCommand(input string) (parsedCommand, error) {
 	var b strings.Builder
 	var tokenQuoted bool
 	var tokenHasQuotedNewline bool
+	stdoutToDevNull := false
 	stderrToDevNull := false
 	inSingle, inDouble := false, false
 
@@ -137,11 +142,29 @@ func parseCommand(input string) (parsedCommand, error) {
 		if len(current) == 0 {
 			return fmt.Errorf("operator %q without command", op)
 		}
-		out.segments = append(out.segments, commandSegment{args: current, stderrToDevNull: stderrToDevNull})
+		out.segments = append(out.segments, commandSegment{args: current, stdoutToDevNull: stdoutToDevNull, stderrToDevNull: stderrToDevNull})
 		out.ops = append(out.ops, op)
 		current = nil
+		stdoutToDevNull = false
 		stderrToDevNull = false
 		return nil
+	}
+	consumeDevNullRedirect := func(pos int, prefix, stream string, seen *bool) (bool, int, error) {
+		if !strings.HasPrefix(input[pos:], prefix) {
+			return false, pos, nil
+		}
+		if len(current) == 0 {
+			return false, pos, fmt.Errorf("%s redirection without command", stream)
+		}
+		next := pos + len(prefix)
+		if next < len(input) && !isRedirectBoundary(input[next]) {
+			return false, pos, fmt.Errorf("unsupported %s redirection", stream)
+		}
+		if *seen {
+			return false, pos, fmt.Errorf("duplicate %s redirection", stream)
+		}
+		*seen = true
+		return true, next - 1, nil
 	}
 
 	for i := 0; i < len(input); i++ {
@@ -189,20 +212,25 @@ func parseCommand(input string) (parsedCommand, error) {
 		if isControlByte(c) && c != '\t' && c != '\n' && c != '\r' {
 			return parsedCommand{}, errors.New("control characters are not allowed")
 		}
-		if b.Len() == 0 && !tokenQuoted && strings.HasPrefix(input[i:], "2>/dev/null") {
-			if len(current) == 0 {
-				return parsedCommand{}, errors.New("stderr redirection without command")
+		if b.Len() == 0 && !tokenQuoted {
+			if ok, next, err := consumeDevNullRedirect(i, "1>/dev/null", "stdout", &stdoutToDevNull); err != nil {
+				return parsedCommand{}, err
+			} else if ok {
+				i = next
+				continue
 			}
-			next := i + len("2>/dev/null")
-			if next < len(input) && !isRedirectBoundary(input[next]) {
-				return parsedCommand{}, errors.New("unsupported stderr redirection")
+			if ok, next, err := consumeDevNullRedirect(i, ">/dev/null", "stdout", &stdoutToDevNull); err != nil {
+				return parsedCommand{}, err
+			} else if ok {
+				i = next
+				continue
 			}
-			if stderrToDevNull {
-				return parsedCommand{}, errors.New("duplicate stderr redirection")
+			if ok, next, err := consumeDevNullRedirect(i, "2>/dev/null", "stderr", &stderrToDevNull); err != nil {
+				return parsedCommand{}, err
+			} else if ok {
+				i = next
+				continue
 			}
-			stderrToDevNull = true
-			i = next - 1
-			continue
 		}
 
 		switch c {
@@ -262,7 +290,7 @@ func parseCommand(input string) (parsedCommand, error) {
 	if len(current) == 0 {
 		return parsedCommand{}, errors.New("trailing operator")
 	}
-	out.segments = append(out.segments, commandSegment{args: current, stderrToDevNull: stderrToDevNull})
+	out.segments = append(out.segments, commandSegment{args: current, stdoutToDevNull: stdoutToDevNull, stderrToDevNull: stderrToDevNull})
 	return out, nil
 }
 
@@ -380,8 +408,11 @@ func validateNL(args []token) ([]string, error) {
 }
 
 func validateSed(args []token) ([]string, error) {
+	if len(args) == 2 && isSafeSedSubstituteScript(args[1].text) {
+		return texts(args), nil
+	}
 	if len(args) < 3 || args[1].quoted || args[1].text != "-n" {
-		return nil, errors.New("sed only allows -n with a numeric print script")
+		return nil, errors.New("sed only allows -n with a numeric print script or a safe stdin substitute script")
 	}
 	if !isSafeSedPrintScript(args[2].text) {
 		return nil, errors.New("sed only allows numeric print scripts")
@@ -415,6 +446,18 @@ func isSafeSedPrintScript(script string) bool {
 		}
 	}
 	return true
+}
+
+func isSafeSedSubstituteScript(script string) bool {
+	if len(script) < 4 || script[0] != 's' || strings.Contains(script, "\\") || !isSafeSedDelimiter(script[1]) {
+		return false
+	}
+	parts := strings.Split(script[2:], string(script[1]))
+	return len(parts) == 3 && parts[0] != "" && (parts[2] == "" || parts[2] == "g")
+}
+
+func isSafeSedDelimiter(c byte) bool {
+	return strings.ContainsRune("#/|,:@", rune(c))
 }
 
 func validateDU(args []token) ([]string, error) {
@@ -686,32 +729,63 @@ func validateFind(args []token) ([]string, error) {
 }
 
 func validateGit(args []token) ([]string, error) {
-	if len(args) < 2 || args[1].quoted || strings.HasPrefix(args[1].text, "-") {
-		return nil, errors.New("unsupported git invocation")
+	prefix, subArgs, err := normalizeGitInvocation(args)
+	if err != nil {
+		return nil, err
 	}
-	switch args[1].text {
-	case "status":
-		return validateGitStatus(args)
-	case "diff":
-		return validateGitDiff(args)
-	case "log":
-		return validateGitLog(args)
-	case "branch":
-		if len(args) == 3 && !args[2].quoted && args[2].text == "--show-current" {
-			return texts(args), nil
-		}
-	case "rev-parse":
-		return validateGitRevParse(args)
-	case "ls-files":
-		return validateGitLsFiles(args)
-	case "remote":
-		if len(args) == 2 || (len(args) == 3 && !args[2].quoted && args[2].text == "-v") {
-			return texts(args), nil
-		}
-	case "tag":
-		return validateGitTag(args)
+	validators := map[string]segmentValidator{
+		"status": validateGitStatus, "diff": validateGitDiff, "log": validateGitLog, "branch": validateGitBranch,
+		"rev-parse": validateGitRevParse, "ls-files": validateGitLsFiles, "remote": validateGitRemote, "tag": validateGitTag,
+		"show": validateGitShow, "grep": validateGitGrep, "ls-tree": validateGitLsTree, "merge-base": validateGitMergeBase,
 	}
-	return nil, errors.New("unsupported git command")
+	validator, ok := validators[subArgs[1].text]
+	if !ok {
+		return nil, errors.New("unsupported git command")
+	}
+	normalized, err := validator(subArgs)
+	if err != nil {
+		return nil, err
+	}
+	return append(prefix, normalized[1:]...), nil
+}
+
+func normalizeGitInvocation(args []token) ([]string, []token, error) {
+	if len(args) < 2 {
+		return nil, nil, errors.New("unsupported git invocation")
+	}
+	prefix := []string{"git"}
+	i := 1
+	for i < len(args) && args[i].text == "-C" && !args[i].quoted {
+		if i+1 >= len(args) {
+			return nil, nil, errors.New("git -C requires a path")
+		}
+		if err := validatePathArg(args[i+1]); err != nil {
+			return nil, nil, err
+		}
+		prefix = append(prefix, "-C", args[i+1].text)
+		i += 2
+	}
+	if i >= len(args) || args[i].quoted || strings.HasPrefix(args[i].text, "-") {
+		return nil, nil, errors.New("unsupported git invocation")
+	}
+	subArgs := make([]token, 1, len(args)-i+1)
+	subArgs[0] = args[0]
+	subArgs = append(subArgs, args[i:]...)
+	return prefix, subArgs, nil
+}
+
+func validateGitBranch(args []token) ([]string, error) {
+	if len(args) == 3 && !args[2].quoted && args[2].text == "--show-current" {
+		return texts(args), nil
+	}
+	return nil, errors.New("unsupported git branch arguments")
+}
+
+func validateGitRemote(args []token) ([]string, error) {
+	if len(args) == 2 || (len(args) == 3 && !args[2].quoted && args[2].text == "-v") {
+		return texts(args), nil
+	}
+	return nil, errors.New("unsupported git remote arguments")
 }
 
 func validateGitStatus(args []token) ([]string, error) {
@@ -779,14 +853,29 @@ func validateGitDiff(args []token) ([]string, error) {
 	if explicitPathspecs && pathspecs == 0 {
 		return nil, errors.New("git diff pathspecs require --")
 	}
-	if seenOutput == "" && revArgs == 0 && pathspecs == 0 {
-		return nil, errors.New("patch-producing git diff is not allowed")
+	return withGitDiffHardening("diff", args[2:]), nil
+}
+
+func withGitDiffHardening(command string, tail []token) []string {
+	out := []string{"git", command, "--no-ext-diff", "--no-textconv"}
+	for _, arg := range tail {
+		if !arg.quoted && oneOf(arg.text, "--no-ext-diff", "--no-textconv") {
+			continue
+		}
+		out = append(out, arg.text)
 	}
-	normalized := append([]string{"git", "diff", "--no-ext-diff", "--no-textconv"}, texts(args[2:])...)
-	return normalized, nil
+	return out
 }
 
 func isSafeGitDiffRev(value string) bool {
+	return isSafeGitName(value, "._/@+-^~")
+}
+
+func isSafeGitObject(value string) bool {
+	return isSafeGitName(value, "._/@+-^~:")
+}
+
+func isSafeGitName(value, extra string) bool {
 	if value == "" || strings.HasPrefix(value, "-") || strings.Contains(value, ":/") || strings.Contains(value, "@{") {
 		return false
 	}
@@ -795,7 +884,7 @@ func isSafeGitDiffRev(value string) bool {
 		case r >= 'a' && r <= 'z':
 		case r >= 'A' && r <= 'Z':
 		case r >= '0' && r <= '9':
-		case strings.ContainsRune("._/@+-^~", r):
+		case strings.ContainsRune(extra, r):
 		default:
 			return false
 		}
@@ -816,7 +905,7 @@ func validateGitLog(args []token) ([]string, error) {
 			if _, bad := reject[a.text]; bad {
 				return nil, errors.New("diff-producing git log mode is not allowed")
 			}
-			if oneOf(a.text, "--oneline", "--graph", "--decorate", "--all") && !a.quoted {
+			if oneOf(a.text, "--oneline", "--graph", "--decorate", "--all", "--left-right", "--cherry-pick") && !a.quoted {
 				continue
 			}
 			if a.text == "-n" || a.text == "--max-count" {
@@ -861,7 +950,13 @@ func validateGitRevParse(args []token) ([]string, error) {
 	if len(args) == 3 && !args[2].quoted && oneOf(args[2].text, "--show-toplevel", "--git-dir", "--is-inside-work-tree") {
 		return texts(args), nil
 	}
+	if len(args) == 3 && isSafeGitObject(args[2].text) {
+		return texts(args), nil
+	}
 	if len(args) == 4 && !args[2].quoted && !args[3].quoted && args[2].text == "--abbrev-ref" && args[3].text == "HEAD" {
+		return texts(args), nil
+	}
+	if len(args) == 4 && !args[2].quoted && !args[3].quoted && oneOf(args[2].text, "--short", "--verify") && isSafeGitObject(args[3].text) {
 		return texts(args), nil
 	}
 	return nil, errors.New("unsupported git rev-parse arguments")
@@ -905,6 +1000,123 @@ func validateGitTag(args []token) ([]string, error) {
 		return texts(args), nil
 	}
 	return nil, errors.New("unsupported git tag arguments")
+}
+
+func validateGitShow(args []token) ([]string, error) {
+	boolFlags := set("--no-ext-diff", "--no-textconv", "--stat", "--name-only", "--name-status", "--oneline", "--decorate")
+	objects := 0
+	for i := 2; i < len(args); i++ {
+		a := args[i]
+		if _, ok := boolFlags[a.text]; ok && !a.quoted {
+			continue
+		}
+		if strings.HasPrefix(a.text, "--unified=") && !a.quoted && isUint(strings.TrimPrefix(a.text, "--unified=")) {
+			continue
+		}
+		if strings.HasPrefix(a.text, "--format=") && !a.quoted && oneOf(strings.TrimPrefix(a.text, "--format="), "medium", "oneline", "short", "full", "fuller") {
+			continue
+		}
+		if strings.HasPrefix(a.text, "-") {
+			return nil, errors.New("unsupported git show flag")
+		}
+		if !isSafeGitObject(a.text) {
+			return nil, errors.New("unsupported git show object")
+		}
+		objects++
+	}
+	if objects > 1 {
+		return nil, errors.New("git show allows one object")
+	}
+	return withGitDiffHardening("show", args[2:]), nil
+}
+
+func validateGitGrep(args []token) ([]string, error) {
+	boolFlags := set("-n", "-i", "-I", "-F", "-w", "--line-number", "--ignore-case", "--fixed-strings", "--word-regexp", "--files-with-matches", "--files-without-match", "--count")
+	positionals := 0
+	afterSep := false
+	for i := 2; i < len(args); i++ {
+		a := args[i]
+		if !afterSep && a.text == "--" && !a.quoted {
+			afterSep = true
+			continue
+		}
+		if afterSep {
+			if err := validateGitPathspec(a); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if _, ok := boolFlags[a.text]; ok && !a.quoted {
+			continue
+		}
+		if strings.HasPrefix(a.text, "-") {
+			return nil, errors.New("unsupported git grep flag")
+		}
+		if positionals > 0 && !isSafeGitObject(a.text) {
+			return nil, errors.New("unsupported git grep revision")
+		}
+		positionals++
+	}
+	if positionals == 0 {
+		return nil, errors.New("git grep requires a pattern")
+	}
+	return texts(args), nil
+}
+
+func validateGitLsTree(args []token) ([]string, error) {
+	boolFlags := set("-r", "-d", "-t", "-l", "-z", "--name-only", "--long")
+	seenTree := false
+	afterSep := false
+	pathspecs := 0
+	for i := 2; i < len(args); i++ {
+		a := args[i]
+		if !seenTree {
+			if _, ok := boolFlags[a.text]; ok && !a.quoted {
+				continue
+			}
+			if strings.HasPrefix(a.text, "-") || !isSafeGitObject(a.text) {
+				return nil, errors.New("unsupported git ls-tree tree")
+			}
+			seenTree = true
+			continue
+		}
+		if !afterSep {
+			if a.text == "--" && !a.quoted {
+				afterSep = true
+				continue
+			}
+			return nil, errors.New("git ls-tree pathspecs require --")
+		}
+		if err := validateGitPathspec(a); err != nil {
+			return nil, err
+		}
+		pathspecs++
+	}
+	if !seenTree {
+		return nil, errors.New("git ls-tree requires a tree")
+	}
+	if afterSep && pathspecs == 0 {
+		return nil, errors.New("git ls-tree pathspecs require --")
+	}
+	return texts(args), nil
+}
+
+func validateGitMergeBase(args []token) ([]string, error) {
+	revs := 0
+	for i := 2; i < len(args); i++ {
+		a := args[i]
+		if !a.quoted && a.text == "--all" {
+			continue
+		}
+		if a.quoted || !isSafeGitObject(a.text) {
+			return nil, errors.New("unsupported git merge-base revision")
+		}
+		revs++
+	}
+	if revs < 2 {
+		return nil, errors.New("git merge-base requires two revisions")
+	}
+	return texts(args), nil
 }
 
 func validateSort(args []token) ([]string, error) {
