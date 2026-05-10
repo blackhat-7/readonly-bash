@@ -49,6 +49,9 @@ func Classify(command string) Classification {
 	if err != nil {
 		return ask(err.Error())
 	}
+	if err := validateCommandShape(parsed); err != nil {
+		return ask(err.Error())
+	}
 
 	parts := make([]string, 0, len(parsed.segments)*2-1)
 	for i, segment := range parsed.segments {
@@ -71,6 +74,46 @@ func Classify(command string) Classification {
 
 func ask(reason string) Classification {
 	return Classification{Decision: DecisionAsk, Reason: reason}
+}
+
+func validateCommandShape(parsed parsedCommand) error {
+	cdIndex := -1
+	hasGit := false
+	for i, segment := range parsed.segments {
+		if len(segment.args) == 0 {
+			continue
+		}
+		switch segment.args[0].text {
+		case "cd":
+			if cdIndex >= 0 {
+				return errors.New("multiple cd commands are not auto-approved")
+			}
+			cdIndex = i
+		case "git":
+			hasGit = true
+		}
+	}
+	if cdIndex < 0 {
+		return nil
+	}
+	if cdIndex != 0 {
+		return errors.New("cd must be the first command segment")
+	}
+	if len(parsed.segments) < 2 {
+		return errors.New("standalone cd is not auto-approved")
+	}
+	if len(parsed.ops) == 0 || parsed.ops[0] != "&&" {
+		return errors.New("cd must be followed by &&")
+	}
+	for _, op := range parsed.ops[1:] {
+		if op == ";" || op == "||" {
+			return errors.New("cd command chains cannot use ; or ||")
+		}
+	}
+	if hasGit {
+		return errors.New("cd with git is not auto-approved")
+	}
+	return nil
 }
 
 func parseCommand(input string) (parsedCommand, error) {
@@ -233,7 +276,7 @@ func validateSegment(args []token) ([]string, error) {
 	}
 
 	validators := map[string]segmentValidator{
-		"pwd": validatePwd, "ls": validateLS, "cat": validateCat, "head": validateHeadTail, "tail": validateHeadTail,
+		"pwd": validatePwd, "cd": validateCd, "ls": validateLS, "cat": validateCat, "head": validateHeadTail, "tail": validateHeadTail,
 		"nl": validateNL, "wc": validateWC, "rg": validateRG, "grep": validateGrep, "find": validateFind, "git": validateGit,
 		"du": validateDU, "df": validateDF, "file": validateFile, "echo": validateEchoPrintf, "printf": validateEchoPrintf,
 		"date": validateDate, "uname": validateUname, "whoami": validateNoArgs, "id": validateNoArgs,
@@ -259,6 +302,19 @@ func validatePwd(args []token) ([]string, error) {
 		return texts(args), nil
 	}
 	return nil, errors.New("unsupported pwd arguments")
+}
+
+func validateCd(args []token) ([]string, error) {
+	if len(args) != 2 {
+		return nil, errors.New("cd requires exactly one path operand")
+	}
+	if strings.HasPrefix(args[1].text, "-") {
+		return nil, errors.New("leading-dash cd path is not allowed")
+	}
+	if err := validatePathArg(args[1]); err != nil {
+		return nil, err
+	}
+	return texts(args), nil
 }
 
 func validateLS(args []token) ([]string, error) {
