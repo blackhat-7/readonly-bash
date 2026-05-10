@@ -21,8 +21,9 @@ type Classification struct {
 }
 
 type token struct {
-	text   string
-	quoted bool
+	text             string
+	quoted           bool
+	hasQuotedNewline bool
 }
 
 type commandSegment struct {
@@ -78,19 +79,15 @@ func ask(reason string) Classification {
 
 func validateCommandShape(parsed parsedCommand) error {
 	cdIndex := -1
-	hasGit := false
 	for i, segment := range parsed.segments {
 		if len(segment.args) == 0 {
 			continue
 		}
-		switch segment.args[0].text {
-		case "cd":
+		if segment.args[0].text == "cd" {
 			if cdIndex >= 0 {
 				return errors.New("multiple cd commands are not auto-approved")
 			}
 			cdIndex = i
-		case "git":
-			hasGit = true
 		}
 	}
 	if cdIndex < 0 {
@@ -110,9 +107,6 @@ func validateCommandShape(parsed parsedCommand) error {
 			return errors.New("cd command chains cannot use ; or ||")
 		}
 	}
-	if hasGit {
-		return errors.New("cd with git is not auto-approved")
-	}
 	return nil
 }
 
@@ -125,6 +119,7 @@ func parseCommand(input string) (parsedCommand, error) {
 	var current []token
 	var b strings.Builder
 	var tokenQuoted bool
+	var tokenHasQuotedNewline bool
 	stderrToDevNull := false
 	inSingle, inDouble := false, false
 
@@ -132,9 +127,10 @@ func parseCommand(input string) (parsedCommand, error) {
 		if b.Len() == 0 && !tokenQuoted {
 			return
 		}
-		current = append(current, token{text: b.String(), quoted: tokenQuoted})
+		current = append(current, token{text: b.String(), quoted: tokenQuoted, hasQuotedNewline: tokenHasQuotedNewline})
 		b.Reset()
 		tokenQuoted = false
+		tokenHasQuotedNewline = false
 	}
 	addOp := func(op string) error {
 		flushToken()
@@ -155,7 +151,11 @@ func parseCommand(input string) (parsedCommand, error) {
 			case '\'':
 				inSingle = false
 			case '\n', '\r':
-				return parsedCommand{}, errors.New("newlines are not allowed")
+				tokenHasQuotedNewline = true
+				b.WriteByte('\n')
+				if c == '\r' && i+1 < len(input) && input[i+1] == '\n' {
+					i++
+				}
 			case '$', '`':
 				return parsedCommand{}, errors.New("expansion syntax is not allowed")
 			default:
@@ -171,7 +171,11 @@ func parseCommand(input string) (parsedCommand, error) {
 			case '"':
 				inDouble = false
 			case '\n', '\r':
-				return parsedCommand{}, errors.New("newlines are not allowed")
+				tokenHasQuotedNewline = true
+				b.WriteByte('\n')
+				if c == '\r' && i+1 < len(input) && input[i+1] == '\n' {
+					i++
+				}
 			case '$', '`', '\\':
 				return parsedCommand{}, errors.New("expansion syntax is not allowed")
 			default:
@@ -182,7 +186,7 @@ func parseCommand(input string) (parsedCommand, error) {
 			}
 			continue
 		}
-		if isControlByte(c) && c != '\t' {
+		if isControlByte(c) && c != '\t' && c != '\n' && c != '\r' {
 			return parsedCommand{}, errors.New("control characters are not allowed")
 		}
 		if b.Len() == 0 && !tokenQuoted && strings.HasPrefix(input[i:], "2>/dev/null") {
@@ -234,7 +238,14 @@ func parseCommand(input string) (parsedCommand, error) {
 			if err := addOp(";"); err != nil {
 				return parsedCommand{}, err
 			}
-		case '\n', '\r', '<', '>', '(', ')', '#', '!', '\\':
+		case '\n', '\r':
+			if err := addOp(";"); err != nil {
+				return parsedCommand{}, err
+			}
+			if c == '\r' && i+1 < len(input) && input[i+1] == '\n' {
+				i++
+			}
+		case '<', '>', '(', ')', '#', '!', '\\':
 			return parsedCommand{}, fmt.Errorf("unsupported shell syntax %q", c)
 		case '$', '`':
 			return parsedCommand{}, errors.New("expansion syntax is not allowed")
@@ -256,7 +267,7 @@ func parseCommand(input string) (parsedCommand, error) {
 }
 
 func isRedirectBoundary(c byte) bool {
-	return c == ' ' || c == '\t' || c == '&' || c == '|' || c == ';'
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '&' || c == '|' || c == ';'
 }
 
 func isControlByte(c byte) bool {
@@ -274,10 +285,13 @@ func validateSegment(args []token) ([]string, error) {
 	if _, denied := networkCommands[cmd]; denied {
 		return nil, fmt.Errorf("network-capable command %q is not auto-approved", cmd)
 	}
+	if cmd != "printf" && hasQuotedNewline(args) {
+		return nil, errors.New("quoted newlines are only allowed for printf")
+	}
 
 	validators := map[string]segmentValidator{
 		"pwd": validatePwd, "cd": validateCd, "ls": validateLS, "cat": validateCat, "head": validateHeadTail, "tail": validateHeadTail,
-		"nl": validateNL, "wc": validateWC, "rg": validateRG, "grep": validateGrep, "find": validateFind, "git": validateGit,
+		"nl": validateNL, "sed": validateSed, "wc": validateWC, "rg": validateRG, "grep": validateGrep, "find": validateFind, "git": validateGit,
 		"du": validateDU, "df": validateDF, "file": validateFile, "echo": validateEchoPrintf, "printf": validateEchoPrintf,
 		"date": validateDate, "uname": validateUname, "whoami": validateNoArgs, "id": validateNoArgs,
 		"hostname": validateNoArgs, "uptime": validateNoArgs, "true": validateNoArgs, "sort": validateSort,
@@ -288,6 +302,15 @@ func validateSegment(args []token) ([]string, error) {
 		return nil, fmt.Errorf("command %q is not allowlisted", cmd)
 	}
 	return validator(args)
+}
+
+func hasQuotedNewline(args []token) bool {
+	for _, arg := range args {
+		if arg.hasQuotedNewline {
+			return true
+		}
+	}
+	return false
 }
 
 func validateNoArgs(args []token) ([]string, error) {
@@ -354,6 +377,44 @@ func validateNL(args []token) ([]string, error) {
 		return nil, errors.New("nl requires a path operand")
 	}
 	return texts(args), nil
+}
+
+func validateSed(args []token) ([]string, error) {
+	if len(args) < 3 || args[1].quoted || args[1].text != "-n" {
+		return nil, errors.New("sed only allows -n with a numeric print script")
+	}
+	if !isSafeSedPrintScript(args[2].text) {
+		return nil, errors.New("sed only allows numeric print scripts")
+	}
+	for _, arg := range args[3:] {
+		if isLeadingDash(arg) {
+			return nil, errors.New("sed file operands cannot start with dash")
+		}
+		if err := validatePathArg(arg); err != nil {
+			return nil, err
+		}
+	}
+	return texts(args), nil
+}
+
+func isSafeSedPrintScript(script string) bool {
+	if !strings.HasSuffix(script, "p") {
+		return false
+	}
+	body := strings.TrimSuffix(script, "p")
+	if body == "" {
+		return false
+	}
+	parts := strings.Split(body, ",")
+	if len(parts) > 2 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" || part == "0" || !isUint(part) {
+			return false
+		}
+	}
+	return true
 }
 
 func validateDU(args []token) ([]string, error) {
@@ -674,11 +735,14 @@ func validateGitDiff(args []token) ([]string, error) {
 	outModes := set("--stat", "--numstat", "--shortstat", "--name-only", "--name-status")
 	seenOutput := ""
 	revArgs := 0
+	pathspecs := 0
+	explicitPathspecs := false
 	afterSep := false
 	for i := 2; i < len(args); i++ {
 		a := args[i]
 		if !afterSep && a.text == "--" && !a.quoted {
 			afterSep = true
+			explicitPathspecs = true
 			continue
 		}
 		if !afterSep {
@@ -695,6 +759,9 @@ func validateGitDiff(args []token) ([]string, error) {
 			if strings.HasPrefix(a.text, "-") {
 				return nil, errors.New("unsupported git diff flag")
 			}
+			if err := validateGitPathspec(a); err != nil {
+				return nil, err
+			}
 			if !isSafeGitDiffRev(a.text) {
 				return nil, errors.New("unsupported git diff revision")
 			}
@@ -707,8 +774,12 @@ func validateGitDiff(args []token) ([]string, error) {
 		if err := validateGitPathspec(a); err != nil {
 			return nil, err
 		}
+		pathspecs++
 	}
-	if seenOutput == "" {
+	if explicitPathspecs && pathspecs == 0 {
+		return nil, errors.New("git diff pathspecs require --")
+	}
+	if seenOutput == "" && revArgs == 0 && pathspecs == 0 {
 		return nil, errors.New("patch-producing git diff is not allowed")
 	}
 	normalized := append([]string{"git", "diff", "--no-ext-diff", "--no-textconv"}, texts(args[2:])...)
@@ -756,6 +827,9 @@ func validateGitLog(args []token) ([]string, error) {
 				continue
 			}
 			if strings.HasPrefix(a.text, "-n") && len(a.text) > 2 && isUint(strings.TrimPrefix(a.text, "-n")) && !a.quoted {
+				continue
+			}
+			if isDashCount(a.text) && !a.quoted {
 				continue
 			}
 			if strings.HasPrefix(a.text, "--max-count=") && isUint(strings.TrimPrefix(a.text, "--max-count=")) && !a.quoted {
